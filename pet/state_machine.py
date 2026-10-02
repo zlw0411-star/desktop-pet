@@ -121,13 +121,15 @@ class StateMachine:
         else:
             self._enter(PetState.FALL)
 
-    def on_click(self):
+    def on_click(self, pet=False):
         if self.state in (PetState.DRAG, PetState.THROWN):
             return
         self.idle_streak = 0
         self.vx = 0.0
         self.vy = 0.0
-        if self.rng.random() < 0.5:
+        if pet:
+            self._enter(PetState.PET)
+        elif self.rng.random() < 0.5:
             self._enter(PetState.PET)
         else:
             self._enter(PetState.REACT)

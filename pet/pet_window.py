@@ -20,6 +20,9 @@ class PetWindow(QWidget):
     context_menu_requested = Signal(QPoint)
     state_changed = Signal(object)
     image_dropped = Signal(str)
+    file_dropped = Signal(str)
+    petted = Signal(bool)
+    thrown = Signal()
 
     def __init__(self, config, parent=None):
         super().__init__(parent, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
@@ -63,6 +66,9 @@ class PetWindow(QWidget):
         self._startle_cooldown = 0.0
         self._sparkle_timer = 0.0
         self._clock = 0.0
+        self._walk_target = None
+        self._dance_left = 0
+        self._perch_hwnd = 0
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -153,8 +159,13 @@ class PetWindow(QWidget):
         dt = min(self._elapsed.restart() / 1000.0, 0.1)
         self._clock += dt
         ctx = self._context()
-        if not self._dragging:
+        if self._perch_hwnd and not self._dragging:
+            self._follow_perch()
+        elif not self._dragging:
+            extra = self._walk_step(dt, ctx)
             move = self.sm.tick(dt, ctx)
+            if extra is not None:
+                move = extra
             if not move.isNull():
                 self.move(self._clamp(self.pos() + move.toPoint(), ctx.screen))
         else:
@@ -167,9 +178,17 @@ class PetWindow(QWidget):
         self._ambient_sparkles(dt)
 
         if self.sm.state != self._last_state:
+            prev = self._last_state
             self._last_state = self.sm.state
             self._apply_interval()
             self.state_changed.emit(self.sm.state)
+            if self.sm.state == PetState.THROWN and prev != PetState.THROWN:
+                self.thrown.emit()
+            if self._dance_left and prev in (PetState.HOP, PetState.FALL) and self.sm.state in (
+                    PetState.IDLE, PetState.WALK):
+                self._dance_left -= 1
+                if self._dance_left:
+                    self.sm.force(PetState.HOP)
         self._render()
 
     def _handle_events(self, dt):
@@ -315,10 +334,66 @@ class PetWindow(QWidget):
             self.show()
 
     def enter_talk(self):
+        self.unperch()
         self.sm.on_double_click()
 
     def finish_talk(self):
         self.sm.finish_talk()
+
+    def walk_to_cursor(self):
+        self.unperch()
+        cursor = self.cursor().pos()
+        self._walk_target = cursor.x() - self.size_px // 2
+
+    def dance(self):
+        self.unperch()
+        self._walk_target = None
+        self._dance_left = 3
+        self.sm.force(PetState.HOP)
+
+    def perch(self, hwnd):
+        if not hwnd:
+            return False
+        self._walk_target = None
+        self._perch_hwnd = int(hwnd)
+        return self._follow_perch()
+
+    def unperch(self):
+        self._perch_hwnd = 0
+
+    def _walk_step(self, dt, ctx):
+        if self._walk_target is None:
+            return None
+        x = self.pos().x()
+        dx = self._walk_target - x
+        if abs(dx) < 8:
+            self._walk_target = None
+            self.sm.force(PetState.IDLE)
+            return QPointF(0.0, 0.0)
+        self.sm.facing = 1 if dx > 0 else -1
+        if self.sm.state != PetState.WALK:
+            self.sm.force(PetState.WALK)
+        speed = self.sm.walk_speed * self.sm.scale
+        step = max(-speed * dt, min(speed * dt, dx))
+        return QPointF(step, 0.0)
+
+    def _follow_perch(self):
+        from . import win32util
+
+        if not win32util.is_window_visible(self._perch_hwnd):
+            self._perch_hwnd = 0
+            return False
+        box = win32util.window_rect(self._perch_hwnd)
+        if box is None:
+            self._perch_hwnd = 0
+            return False
+        left, top, right, _bottom = box
+        x = int((left + right) / 2 - self.size_px / 2)
+        y = int(top - self.size_px + 18)
+        self.move(self._clamp(QPoint(x, y), self.screen().availableGeometry()))
+        if self.sm.state not in (PetState.IDLE, PetState.SLEEP, PetState.PET, PetState.REACT):
+            self.sm.force(PetState.IDLE)
+        return True
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -327,6 +402,7 @@ class PetWindow(QWidget):
             self._drag_samples.clear()
             self._drag_samples.append((time.monotonic(), event.globalPosition().toPoint()))
             self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self.unperch()
             self.sm.on_press()
         else:
             super().mousePressEvent(event)
@@ -360,8 +436,12 @@ class PetWindow(QWidget):
             if self._moved:
                 self.sm.on_release(self._release_velocity())
             else:
-                self.sm.on_click()
-                self.particles.hearts(self.size_px * 0.5, self.size_px * 0.28, count=5)
+                local = event.position()
+                head = local.y() < self.size_px * 0.42
+                self.sm.on_click(pet=head)
+                cy = self.size_px * (0.22 if head else 0.32)
+                self.particles.hearts(self.size_px * 0.5, cy, count=8 if head else 5)
+                self.petted.emit(head)
         else:
             super().mouseReleaseEvent(event)
 
@@ -379,21 +459,24 @@ class PetWindow(QWidget):
         super().enterEvent(event)
 
     def dragEnterEvent(self, event):
-        if event.mimeData().hasUrls() and self._first_image(event) is not None:
+        if event.mimeData().hasUrls() and self._first_file(event) is not None:
             event.acceptProposedAction()
 
     def dropEvent(self, event):
-        path = self._first_image(event)
-        if path is not None:
-            event.acceptProposedAction()
+        path = self._first_file(event)
+        if path is None:
+            return
+        event.acceptProposedAction()
+        from .assets import is_image
+        if is_image(path):
             self.image_dropped.emit(path)
+        else:
+            self.file_dropped.emit(path)
 
     @staticmethod
-    def _first_image(event):
-        from .assets import is_image
-
+    def _first_file(event):
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path and is_image(path):
+            if path:
                 return path
         return None

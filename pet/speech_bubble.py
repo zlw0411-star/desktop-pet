@@ -14,7 +14,8 @@ PAD_Y = 9
 TAIL = 9
 RADIUS = 14
 MARGIN = 7
-HIDE_MS = 9000
+MIN_HIDE_MS = 3000
+MAX_HIDE_MS = 12000
 
 
 class SpeechBubble(QWidget):
@@ -78,7 +79,11 @@ class SpeechBubble(QWidget):
         self._resize()
         self._reposition()
         self.update()
-        self._hide_timer.start(HIDE_MS)
+        self._hide_timer.start(self._hide_ms(self._text))
+
+    @staticmethod
+    def _hide_ms(text):
+        return max(MIN_HIDE_MS, min(MAX_HIDE_MS, 2000 + len(text or "") * 80))
 
     def hideEvent(self, event):
         self._follow_timer.stop()

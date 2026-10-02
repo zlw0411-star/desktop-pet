@@ -44,10 +44,13 @@ class AIClient(QObject):
                 models.append(name)
         return [m for m in models if m]
 
-    def send(self, text):
+    def send(self, text, mood_line=""):
         text = (text or "").strip()
-        if not text or self._reply is not None:
+        if not text:
             return
+        self._mood_line = mood_line or ""
+        if self._reply is not None:
+            self.cancel()
         if not self.is_configured():
             self.busy_changed.emit(True)
             QTimer.singleShot(250, lambda: self._placeholder(text))
@@ -79,8 +82,12 @@ class AIClient(QObject):
         self._stream_buffer = b""
         self._stream_text = ""
         self._replied = False
+        self._mood_line = getattr(self, "_mood_line", "")
 
-        messages = [{"role": "system", "content": cfg.get("system_prompt", "")}]
+        prompt = cfg.get("system_prompt", "")
+        if self._mood_line:
+            prompt = (prompt + "\n" + self._mood_line).strip()
+        messages = [{"role": "system", "content": prompt}]
         messages.extend(self._history[-int(cfg.get("max_history", 12)):])
 
         payload = {
@@ -186,7 +193,17 @@ class AIClient(QObject):
         return ""
 
     def cancel(self):
-        if self._reply is not None:
-            self._reply.abort()
-            self._reply = None
+        reply = self._reply
+        self._reply = None
+        if reply is not None:
+            try:
+                reply.readyRead.disconnect(self._on_ready_read)
+            except (TypeError, RuntimeError):
+                pass
+            try:
+                reply.finished.disconnect(self._on_finished)
+            except (TypeError, RuntimeError):
+                pass
+            reply.abort()
+            reply.deleteLater()
         self.busy_changed.emit(False)

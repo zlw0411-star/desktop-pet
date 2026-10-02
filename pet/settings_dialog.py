@@ -1,18 +1,15 @@
-from PySide6.QtCore import Qt, Signal, QUrl
-from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
                                QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
-                               QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox,
-                               QVBoxLayout)
+                               QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
+                               QPushButton, QSpinBox, QVBoxLayout)
+from PySide6.QtCore import Signal
 
 from . import autostart
 from .assets import import_image
-from .voice import rvc as rvc_mod
 
 
 class SettingsDialog(QDialog):
     settings_saved = Signal()
-    voice_test_requested = Signal()
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
@@ -80,56 +77,7 @@ class SettingsDialog(QDialog):
         self.autostart_cb.setChecked(autostart.is_enabled())
         b_form.addRow(self.autostart_cb)
 
-        voice = QGroupBox("语音")
-        v_form = QFormLayout(voice)
-        self.voice_cb = QCheckBox("让宠物说话 (TTS)")
-        self.voice_cb.setChecked(bool((config.get("voice") or {}).get("enabled", True)))
-        v_form.addRow(self.voice_cb)
-
-        rcfg = config.get("rvc", {}) or {}
-        rvc = QGroupBox("RVC 音色（用 RVCMAX 的模型说话）")
-        r_form = QFormLayout(rvc)
-        self.rvc_cb = QCheckBox("启用 RVC 音色")
-        self.rvc_cb.setChecked(bool(rcfg.get("enabled", False)))
-        r_form.addRow(self.rvc_cb)
-
-        self.rvc_root_edit = QLineEdit(rcfg.get("root", ""))
-        r_form.addRow("RVCMAX 目录", self.rvc_root_edit)
-
-        self.rvc_model_combo = QComboBox()
-        self.rvc_model_combo.setEditable(True)
-        self.rvc_model_combo.setInsertPolicy(QComboBox.NoInsert)
-        self._reload_models(rcfg.get("model_name", ""))
-        model_row = QHBoxLayout()
-        model_row.addWidget(self.rvc_model_combo, 1)
-        self.rvc_open_btn = QPushButton("打开文件夹")
-        self.rvc_open_btn.clicked.connect(self._open_models_dir)
-        model_row.addWidget(self.rvc_open_btn)
-        r_form.addRow("模型文件", model_row)
-
-        self.rvc_index_edit = QLineEdit(rcfg.get("index_path", ""))
-        self.rvc_index_edit.setPlaceholderText("可留空")
-        r_form.addRow("索引文件", self.rvc_index_edit)
-        self.rvc_model_combo.currentTextChanged.connect(self._sync_index)
-
-        self.rvc_pitch_spin = QSpinBox()
-        self.rvc_pitch_spin.setRange(-24, 24)
-        self.rvc_pitch_spin.setValue(int(rcfg.get("f0up_key", 0)))
-        r_form.addRow("变调 (半音)", self.rvc_pitch_spin)
-
-        self.rvc_method_combo = QComboBox()
-        for label, value in (("rmvpe (推荐)", "rmvpe"), ("harvest", "harvest"),
-                             ("crepe", "crepe"), ("pm", "pm")):
-            self.rvc_method_combo.addItem(label, value)
-        mi = self.rvc_method_combo.findData(rcfg.get("f0method", "rmvpe"))
-        self.rvc_method_combo.setCurrentIndex(mi if mi >= 0 else 0)
-        r_form.addRow("音高算法", self.rvc_method_combo)
-
-        self.rvc_test_btn = QPushButton("测试语音")
-        self.rvc_test_btn.clicked.connect(self.voice_test_requested.emit)
-        r_form.addRow(self.rvc_test_btn)
-
-        ai = QGroupBox("AI 对话（留空则使用占位回复）")
+        ai = QGroupBox("AI 对话")
         a_form = QFormLayout(ai)
         ai_cfg = config.get("ai", {}) or {}
         self.ai_enabled_cb = QCheckBox("启用 AI 对话")
@@ -137,11 +85,11 @@ class SettingsDialog(QDialog):
         a_form.addRow(self.ai_enabled_cb)
 
         self.base_url_edit = QLineEdit(ai_cfg.get("base_url", ""))
-        self.base_url_edit.setPlaceholderText("https://api.deepseek.com/v1")
+        self.base_url_edit.setPlaceholderText("https://open.bigmodel.cn/api/paas/v4")
         a_form.addRow("Base URL", self.base_url_edit)
 
         self.model_edit = QLineEdit(ai_cfg.get("model", ""))
-        self.model_edit.setPlaceholderText("deepseek-chat")
+        self.model_edit.setPlaceholderText("glm-4-flash")
         a_form.addRow("模型", self.model_edit)
 
         self.fallback_edit = QLineEdit(", ".join(ai_cfg.get("fallback_models", []) or []))
@@ -151,6 +99,11 @@ class SettingsDialog(QDialog):
         self.key_env_edit = QLineEdit(ai_cfg.get("api_key_env", "DESKTOP_PET_API_KEY"))
         a_form.addRow("API Key 环境变量", self.key_env_edit)
 
+        self.prompt_edit = QPlainTextEdit(ai_cfg.get("system_prompt", ""))
+        self.prompt_edit.setPlaceholderText("你是一只可爱的桌面宠物…")
+        self.prompt_edit.setFixedHeight(80)
+        a_form.addRow("人设", self.prompt_edit)
+
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.button(QDialogButtonBox.Ok).setText("保存")
         buttons.button(QDialogButtonBox.Cancel).setText("取消")
@@ -159,8 +112,6 @@ class SettingsDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addWidget(behaviour)
-        layout.addWidget(voice)
-        layout.addWidget(rvc)
         layout.addWidget(ai)
         layout.addWidget(buttons)
 
@@ -169,25 +120,6 @@ class SettingsDialog(QDialog):
             import os
             return os.path.basename(self._image_path)
         return "（未选择）"
-
-    def _reload_models(self, current):
-        self.rvc_model_combo.clear()
-        names = [m["name"] for m in rvc_mod.list_models(self.config)]
-        self.rvc_model_combo.addItems(names)
-        if current:
-            index = self.rvc_model_combo.findText(current)
-            if index >= 0:
-                self.rvc_model_combo.setCurrentIndex(index)
-            else:
-                self.rvc_model_combo.setEditText(current)
-
-    def _open_models_dir(self):
-        QDesktopServices.openUrl(QUrl.fromLocalFile(rvc_mod.models_dir(self.config)))
-
-    def _sync_index(self, name):
-        path = rvc_mod.find_index(self.config, name)
-        if path:
-            self.rvc_index_edit.setText(path)
 
     def _pick_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -216,19 +148,6 @@ class SettingsDialog(QDialog):
         cfg["always_on_top"] = self.top_cb.isChecked()
         cfg["autostart"] = self.autostart_cb.isChecked()
 
-        voice = cfg.get("voice", {}) or {}
-        voice["enabled"] = self.voice_cb.isChecked()
-        cfg["voice"] = voice
-
-        rvc = cfg.get("rvc", {}) or {}
-        rvc["enabled"] = self.rvc_cb.isChecked()
-        rvc["root"] = self.rvc_root_edit.text().strip()
-        rvc["model_name"] = self.rvc_model_combo.currentText().strip()
-        rvc["index_path"] = self.rvc_index_edit.text().strip()
-        rvc["f0up_key"] = int(self.rvc_pitch_spin.value())
-        rvc["f0method"] = self.rvc_method_combo.currentData()
-        cfg["rvc"] = rvc
-
         ai = cfg.get("ai", {}) or {}
         ai["enabled"] = self.ai_enabled_cb.isChecked()
         ai["base_url"] = self.base_url_edit.text().strip()
@@ -236,6 +155,9 @@ class SettingsDialog(QDialog):
         ai["fallback_models"] = [m.strip() for m in self.fallback_edit.text().split(",")
                                  if m.strip()]
         ai["api_key_env"] = self.key_env_edit.text().strip() or "DESKTOP_PET_API_KEY"
+        prompt = self.prompt_edit.toPlainText().strip()
+        if prompt:
+            ai["system_prompt"] = prompt
         cfg["ai"] = ai
 
         cfg.save()

@@ -8,10 +8,10 @@ from .input_bubble import InputBubble
 from .cutout import CutoutWorker
 from .speech_bubble import SpeechBubble
 from .config import Config
+from .personality import Personality
 from .pet_window import PetWindow
 from .settings_dialog import SettingsDialog
 from .tray import TrayManager
-from .voice.speech import SpeechEngine
 
 
 class DesktopPetApp(QObject):
@@ -25,23 +25,34 @@ class DesktopPetApp(QObject):
         self._speech_active = False
 
         self.pet = PetWindow(self.config)
+        self._talk_timer = QTimer(self)
+        self._talk_timer.setSingleShot(True)
+        self._talk_timer.timeout.connect(self.pet.finish_talk)
         self.tray = TrayManager(self.config)
         self.input_bubble = InputBubble()
         self.speech = SpeechBubble()
-        self.tts = SpeechEngine(self.config)
         self.ai = AIClient(self.config)
+        self.persona = Personality(self.config)
         self._greeted = False
         self.speech.set_anchor_getter(lambda: self.pet)
 
         self.pet.chat_requested.connect(self.open_chat)
         self.pet.context_menu_requested.connect(self.show_menu)
         self.pet.image_dropped.connect(self.set_custom_image)
+        self.pet.file_dropped.connect(self.on_file_dropped)
+        self.pet.petted.connect(self.on_petted)
+        self.pet.thrown.connect(self.on_thrown)
         self.tray.action_triggered.connect(self.on_tray_action)
         self.input_bubble.submitted.connect(self.on_user_message)
         self.ai.reply_ready.connect(self.on_reply)
         self.ai.failed.connect(self.on_reply)
         self.ai.chunk.connect(self.on_chunk)
-        self.tts.speaking_changed.connect(self.on_speaking_changed)
+        self.persona.say.connect(self.on_persona_say)
+        self.persona.act.connect(self.on_persona_act)
+
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setInterval(15000)
+        self._idle_timer.timeout.connect(self._on_idle_tick)
 
         self.pet.set_always_on_top(bool(self.config.get("always_on_top", True)))
 
@@ -50,21 +61,73 @@ class DesktopPetApp(QObject):
         self.tray.set_autostart(autostart.is_enabled())
         self.tray.show()
         self.pet.start()
+        self.persona.remember_skip(int(self.pet.winId()))
+        self.persona.remember_skip(int(self.input_bubble.winId()))
+        self.persona.remember_skip(int(self.speech.winId()))
+        self._idle_timer.start()
+        if not self.config.get("shown_hint", False):
+            QTimer.singleShot(1800, self._show_hint)
+
+    def _show_hint(self):
+        if self._greeted or self.input_bubble.isVisible():
+            return
+        self.speech.finalize("双击我就能聊天哦～")
+        self.config["shown_hint"] = True
+        self.config.save()
 
     def open_chat(self):
         self.pet.enter_talk()
-        self.input_bubble.popup_above(self.pet)
+        self.input_bubble.popup_beside(self.pet)
         if not self._greeted:
             self._greeted = True
             self.speech.finalize("你好呀，和我说说话吧～")
+            if not self.config.get("shown_hint", False):
+                self.config["shown_hint"] = True
+                self.config.save()
 
     def on_user_message(self, text):
+        self.persona.on_chat()
+        if self.persona.try_command(text):
+            return
         self.pet.enter_talk()
-        self.input_bubble.hide()
+        self._talk_timer.stop()
         self._speech_active = False
         self.speech.show_stream()
         self.speech.append("…")
-        self.ai.send(text)
+        self.ai.send(text, mood_line=self.persona.mood_line())
+
+    def on_petted(self, head):
+        if head:
+            self.persona.on_pet_head()
+        else:
+            self.persona.on_pet_body()
+
+    def on_thrown(self):
+        self.persona.on_thrown()
+
+    def on_file_dropped(self, path):
+        self.persona.on_file(path)
+
+    def on_persona_say(self, text):
+        if self.input_bubble.isVisible() and self._speech_active:
+            return
+        self.speech.finalize(text)
+
+    def on_persona_act(self, action):
+        if action == "dance":
+            self.pet.dance()
+        elif action == "come":
+            self.pet.walk_to_cursor()
+        elif action == "perch":
+            hwnd = self.persona.last_hwnd
+            if not self.pet.perch(hwnd):
+                self.speech.finalize("没地方坐。")
+        elif action == "unperch":
+            self.pet.unperch()
+
+    def _on_idle_tick(self):
+        busy = self.input_bubble.isVisible() or self._speech_active or self.speech.isVisible()
+        self.persona.tick(busy)
 
     def on_chunk(self, delta):
         if not self._speech_active:
@@ -78,18 +141,7 @@ class DesktopPetApp(QObject):
             self.speech.show_stream()
         self.speech.finalize(text)
         self.pet.enter_talk()
-        voice_on = bool((self.config.get("voice") or {}).get("enabled", True))
-        if voice_on:
-            self.tts.speak(text)
-            QTimer.singleShot(6000, self.pet.finish_talk)
-        else:
-            QTimer.singleShot(4000, self.pet.finish_talk)
-
-    def on_speaking_changed(self, speaking):
-        if speaking:
-            self.pet.enter_talk()
-        else:
-            self.pet.finish_talk()
+        self._talk_timer.start(4000)
 
     def show_menu(self, global_pos):
         self.tray.menu.popup(global_pos)
@@ -121,11 +173,7 @@ class DesktopPetApp(QObject):
     def open_settings(self):
         dialog = SettingsDialog(self.config, self.pet)
         dialog.settings_saved.connect(self.apply_settings)
-        dialog.voice_test_requested.connect(self.test_voice)
         dialog.exec()
-
-    def test_voice(self):
-        self.tts.speak("你好呀，我是你的桌面宠物，这是我的声音。")
 
     def choose_image(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -171,12 +219,12 @@ class DesktopPetApp(QObject):
         self.pet.set_always_on_top(bool(self.config.get("always_on_top", True)))
         self.tray.set_autostart(autostart.is_enabled())
         self.tray.refresh_icon()
-        self.tts.reload()
 
     def quit(self):
+        self._idle_timer.stop()
         self.pet.stop()
         self.pet.save_position()
-        self.tts.shutdown()
+        self.config["mood"] = self.persona.mood
         self.ai.cancel()
         self.config.save()
         self.app.quit()
