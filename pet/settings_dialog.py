@@ -57,6 +57,13 @@ class SettingsDialog(QDialog):
         self.speed_spin.setValue(int(config.get("walk_speed", 60)))
         b_form.addRow("移动速度", self.speed_spin)
 
+        self.fps_spin = QSpinBox()
+        self.fps_spin.setRange(10, 60)
+        self.fps_spin.setSuffix(" FPS")
+        self.fps_spin.setValue(int(config.get("fps", 30)))
+        self.fps_spin.setToolTip("调低可减少资源占用；待机和睡眠会自动使用更低帧率。")
+        b_form.addRow("动画帧率上限", self.fps_spin)
+
         self.wander_cb = QCheckBox("允许自由走动")
         self.wander_cb.setChecked(bool(config.get("wander", True)))
         b_form.addRow(self.wander_cb)
@@ -142,6 +149,7 @@ class SettingsDialog(QDialog):
         cfg["auto_cutout"] = self.cutout_cb.isChecked()
         cfg["scale"] = round(float(self.scale_spin.value()), 2)
         cfg["walk_speed"] = float(self.speed_spin.value())
+        cfg["fps"] = self.fps_spin.value()
         cfg["wander"] = self.wander_cb.isChecked()
         cfg["follow_cursor"] = self.follow_cb.isChecked()
         cfg["sleep_enabled"] = self.sleep_cb.isChecked()

@@ -22,16 +22,14 @@ def import_image(path):
         ("%s|%s|%s" % (src.resolve(), stat.st_size, stat.st_mtime)).encode("utf-8")
     ).hexdigest()[:10]
     dst = ASSET_DIR / ("pet_%s%s" % (digest, src.suffix.lower()))
+    if src.resolve() == dst.resolve():
+        return str(dst)
     try:
         shutil.copy2(src, dst)
     except OSError:
         return None
-    for old in ASSET_DIR.glob("pet_*"):
-        if old != dst:
-            try:
-                old.unlink()
-            except OSError:
-                pass
+    # Keep previous assets: settings may be cancelled, or a worker may still
+    # be reading the currently active image.
     return str(dst)
 
 

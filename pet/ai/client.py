@@ -25,6 +25,9 @@ class AIClient(QObject):
         self._stream_buffer = b""
         self._stream_text = ""
         self._replied = False
+        self._placeholder_timer = QTimer(self)
+        self._placeholder_timer.setSingleShot(True)
+        self._placeholder_timer.timeout.connect(lambda: self._placeholder(""))
 
     def is_configured(self):
         cfg = self.config["ai"]
@@ -49,11 +52,10 @@ class AIClient(QObject):
         if not text:
             return
         self._mood_line = mood_line or ""
-        if self._reply is not None:
-            self.cancel()
+        self.cancel()
         if not self.is_configured():
             self.busy_changed.emit(True)
-            QTimer.singleShot(250, lambda: self._placeholder(text))
+            self._placeholder_timer.start(250)
             return
         self._pending_text = text
         self._history.append({"role": "user", "content": text})
@@ -76,7 +78,9 @@ class AIClient(QObject):
         cfg = self.config["ai"]
         api_key = os.environ.get(cfg.get("api_key_env") or "", "").strip()
         if not api_key:
-            self.reply_ready.emit("缺少 API Key：请设置环境变量 %s。" % cfg.get("api_key_env"))
+            self._discard_pending()
+            self.busy_changed.emit(False)
+            self.failed.emit("缺少 API Key：请设置环境变量 %s。" % cfg.get("api_key_env"))
             return
 
         self._stream_buffer = b""
@@ -151,6 +155,9 @@ class AIClient(QObject):
         if self._stream_text:
             self.busy_changed.emit(False)
             self._history.append({"role": "assistant", "content": self._stream_text})
+            self._pending_text = ""
+            limit = max(2, int(self.config["ai"].get("max_history", 12)))
+            self._history = self._history[-limit:]
             self.reply_ready.emit(self._stream_text.strip())
             return
 
@@ -159,12 +166,14 @@ class AIClient(QObject):
             if self._retry_next():
                 return
             self.busy_changed.emit(False)
+            self._discard_pending()
             self.failed.emit("请求失败：%s" % detail)
             return
 
         if self._retry_next():
             return
         self.busy_changed.emit(False)
+        self._discard_pending()
         self.failed.emit("模型没有返回内容")
 
     def _retry_next(self):
@@ -192,7 +201,14 @@ class AIClient(QObject):
             pass
         return ""
 
+    def _discard_pending(self):
+        if self._pending_text and self._history and self._history[-1]["role"] == "user":
+            self._history.pop()
+        self._pending_text = ""
+
     def cancel(self):
+        self._placeholder_timer.stop()
+        self._discard_pending()
         reply = self._reply
         self._reply = None
         if reply is not None:

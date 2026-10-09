@@ -147,6 +147,6 @@ class SpeechBubble(QWidget):
         painter.setPen(TEXT_COLOR)
         painter.setFont(self._font)
         text_rect = QRect(MARGIN + PAD_X, MARGIN + PAD_Y,
-                          self.width() - MARGIN * 2 - PAD_X * 2, rect.height() - PAD_Y * 2)
+                          self.width() - MARGIN * 2 - PAD_X * 2, int(rect.height()) - PAD_Y * 2)
         painter.drawText(text_rect, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter,
                          self._text)

@@ -122,7 +122,7 @@ class StateMachine:
             self._enter(PetState.FALL)
 
     def on_click(self, pet=False):
-        if self.state in (PetState.DRAG, PetState.THROWN):
+        if self.state == PetState.THROWN:
             return
         self.idle_streak = 0
         self.vx = 0.0
@@ -171,6 +171,12 @@ class StateMachine:
                 self._choose_next_idle()
         elif state == PetState.WALK:
             speed = self.walk_speed * self.scale
+            if self.follow_cursor:
+                dx = ctx.cursor.x() - (ctx.pos.x() + ctx.size.width() / 2)
+                if abs(dx) <= ctx.size.width() * 0.25:
+                    self._enter(PetState.IDLE)
+                    return move
+                self.facing = 1 if dx > 0 else -1
             move = QPointF(self.facing * speed * dt, 0.0)
             if self._at_horizontal_edge(ctx, move.x()):
                 self.facing = -self.facing
@@ -195,7 +201,9 @@ class StateMachine:
             bottom = self._bottom(ctx)
             if ctx.pos.y() + move.y() >= bottom:
                 move.setY(bottom - ctx.pos.y())
-                self._land(abs(self.vy))
+                impact = abs(self.vy)
+                self._land(impact)
+                self._enter(PetState.DIZZY if impact > 950.0 else PetState.IDLE)
         elif state in (PetState.HOP, PetState.THROWN):
             move = self._ballistic(dt, ctx)
         elif state in (PetState.DRAG, PetState.TALK):

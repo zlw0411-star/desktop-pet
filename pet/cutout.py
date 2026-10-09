@@ -1,4 +1,5 @@
 import os
+from importlib.util import find_spec
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
@@ -15,7 +16,11 @@ _session = None
 
 
 def model_path():
-    return MODEL_DIR / MODEL_NAME
+    configured = Path(os.environ.get("U2NET_HOME") or MODEL_DIR) / MODEL_NAME
+    if configured.is_file():
+        return configured
+    bundled = Path(__file__).resolve().parents[1] / "models" / MODEL_NAME
+    return bundled if bundled.is_file() else configured
 
 
 def model_available():
@@ -23,11 +28,8 @@ def model_available():
 
 
 def rembg_available():
-    try:
-        import rembg  # noqa: F401
-        return True
-    except Exception:
-        return False
+    # Importing rembg loads the inference stack; keep that off the UI thread.
+    return all(find_spec(name) is not None for name in ("rembg", "PIL", "onnxruntime"))
 
 
 def available():
@@ -37,7 +39,7 @@ def available():
 def _get_session():
     global _session
     if _session is None:
-        os.environ.setdefault("U2NET_HOME", str(MODEL_DIR))
+        os.environ["U2NET_HOME"] = str(model_path().parent)
         from rembg import new_session
 
         _session = new_session("u2net")
@@ -58,11 +60,11 @@ def _clean_edges(result):
 
 
 def cutout(src_path, dst_path=None):
-    os.environ.setdefault("U2NET_HOME", str(MODEL_DIR))
     from rembg import remove
     from PIL import Image
 
-    image = Image.open(src_path).convert("RGBA")
+    with Image.open(src_path) as source:
+        image = source.convert("RGBA")
     result = remove(image, session=_get_session())
     result = _clean_edges(result)
     bbox = result.getbbox()
@@ -89,7 +91,11 @@ class CutoutWorker(QThread):
         self.dst_path = dst_path
 
     def run(self):
+        global _session
         try:
             self.done.emit(cutout(self.src_path, self.dst_path))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
+        finally:
+            # The model is only needed during image import, not all day.
+            _session = None

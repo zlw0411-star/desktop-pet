@@ -23,6 +23,8 @@ class DesktopPetApp(QObject):
         self._cut_worker = None
         self._pending_image = None
         self._speech_active = False
+        self._ai_busy = False
+        self._quitting = False
 
         self.pet = PetWindow(self.config)
         self._talk_timer = QTimer(self)
@@ -47,6 +49,8 @@ class DesktopPetApp(QObject):
         self.ai.reply_ready.connect(self.on_reply)
         self.ai.failed.connect(self.on_reply)
         self.ai.chunk.connect(self.on_chunk)
+        self.ai.busy_changed.connect(self._on_ai_busy)
+        self.input_bubble.closed.connect(self._on_input_closed)
         self.persona.say.connect(self.on_persona_say)
         self.persona.act.connect(self.on_persona_act)
 
@@ -109,7 +113,7 @@ class DesktopPetApp(QObject):
         self.persona.on_file(path)
 
     def on_persona_say(self, text):
-        if self.input_bubble.isVisible() and self._speech_active:
+        if self._quitting or not self.pet.isVisible() or self._ai_busy:
             return
         self.speech.finalize(text)
 
@@ -126,8 +130,17 @@ class DesktopPetApp(QObject):
             self.pet.unperch()
 
     def _on_idle_tick(self):
-        busy = self.input_bubble.isVisible() or self._speech_active or self.speech.isVisible()
+        if not self.pet.isVisible() or self._quitting:
+            return
+        busy = self.input_bubble.isVisible() or self._ai_busy or self.speech.isVisible()
         self.persona.tick(busy)
+
+    def _on_ai_busy(self, busy):
+        self._ai_busy = busy
+
+    def _on_input_closed(self):
+        if not self._ai_busy:
+            self.pet.finish_talk()
 
     def on_chunk(self, delta):
         if not self._speech_active:
@@ -140,6 +153,7 @@ class DesktopPetApp(QObject):
             self._speech_active = True
             self.speech.show_stream()
         self.speech.finalize(text)
+        self._speech_active = False
         self.pet.enter_talk()
         self._talk_timer.start(4000)
 
@@ -151,6 +165,9 @@ class DesktopPetApp(QObject):
             visible = self.pet.isVisible()
             self.pet.setVisible(not visible)
             if visible:
+                self.ai.cancel()
+                self._talk_timer.stop()
+                self.pet.finish_talk()
                 self.input_bubble.hide()
                 self.speech.hide()
             self.tray.set_pet_visible(not visible)
@@ -183,29 +200,49 @@ class DesktopPetApp(QObject):
             self.set_custom_image(path)
 
     def set_custom_image(self, path):
+        if self._quitting:
+            return
+        if self._cut_worker is not None:
+            self.tray.show_message("更换形象", "正在处理上一张图片，请稍等再换。")
+            return
         stored = import_image(path)
         if not stored:
             self.tray.show_message("更换形象", "无法读取这张图片，请换个格式试试。")
             return
         self._pending_image = stored
-        if self.config.get("auto_cutout", True) and cutout.available():
+        if (self.config.get("auto_cutout", True)
+                and not stored.lower().endswith(".gif") and cutout.available()):
             self.tray.show_message("更换形象", "正在抠图，请稍等…")
             self._cut_worker = CutoutWorker(stored)
             self._cut_worker.done.connect(self._on_cutout_done)
             self._cut_worker.failed.connect(self._on_cutout_failed)
+            self._cut_worker.finished.connect(self._on_cutout_finished)
             self._cut_worker.start()
         else:
             self._apply_image(stored)
             self.tray.show_message("更换形象", "已换成你的图片啦～")
 
     def _on_cutout_done(self, cut_path):
+        if self._quitting:
+            return
         self._apply_image(cut_path)
         self.tray.show_message("更换形象", "抠图完成，漂亮！")
 
     def _on_cutout_failed(self, message):
+        if self._quitting:
+            return
         if getattr(self, "_pending_image", None):
             self._apply_image(self._pending_image)
         self.tray.show_message("更换形象", "抠图失败，已使用原图：%s" % message[:40])
+
+    def _on_cutout_finished(self):
+        worker = self.sender()
+        if self._cut_worker is worker:
+            self._cut_worker = None
+        if worker is not None:
+            worker.deleteLater()
+        if self._quitting:
+            self.app.quit()
 
     def _apply_image(self, path):
         self.config["style"] = "image"
@@ -221,10 +258,19 @@ class DesktopPetApp(QObject):
         self.tray.refresh_icon()
 
     def quit(self):
+        if self._quitting:
+            return
+        self._quitting = True
         self._idle_timer.stop()
+        self._talk_timer.stop()
         self.pet.stop()
         self.pet.save_position()
         self.config["mood"] = self.persona.mood
         self.ai.cancel()
         self.config.save()
-        self.app.quit()
+        self.pet.hide()
+        self.input_bubble.hide()
+        self.speech.hide()
+        self.tray.icon.hide()
+        if self._cut_worker is None or not self._cut_worker.isRunning():
+            self.app.quit()

@@ -31,6 +31,7 @@ class PetWindow(QWidget):
         self.setAcceptDrops(True)
 
         self.config = config
+        self._running = False
         self.scale = float(config.get("scale", 1.0))
         self.style = config.get("style", "blob")
         self.size_px = int(BASE_SIZE * self.scale)
@@ -52,9 +53,9 @@ class PetWindow(QWidget):
         self._drag_offset = QPoint()
         self._moved = False
         self._last_state = self.sm.state
-        self._fps = max(10, int(config.get("fps", 30)))
-        self._mask_counter = 0
+        self._fps = max(10, min(60, int(config.get("fps", 30))))
         self._mask_state = None
+        self._mask_updated_at = float("-inf")
 
         self.particles = ParticleField()
         self._drag_samples = deque(maxlen=8)
@@ -67,6 +68,7 @@ class PetWindow(QWidget):
         self._sparkle_timer = 0.0
         self._clock = 0.0
         self._walk_target = None
+        self._motion_remainder = QPointF()
         self._dance_left = 0
         self._perch_hwnd = 0
 
@@ -98,10 +100,36 @@ class PetWindow(QWidget):
         self.move(self._clamp(pos, screen))
 
     def start(self):
-        self._render()
+        self._running = True
+        if self._sprite is not None and not self._sprite.valid:
+            self._load_sprite()
         self.show()
+        self._resume_animation()
+
+    def _resume_animation(self):
+        if not self._running or not self.isVisible():
+            return
+        self._elapsed.restart()
+        self._last_cursor = self.cursor().pos()
+        if self._sprite is not None:
+            self._sprite.set_paused(False)
+        self._render()
         self._timer.start(max(1, int(1000 / self._fps_for(self.sm.state))))
         self._keep_top_timer.start()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._resume_animation()
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        self._keep_top_timer.stop()
+        if self._sprite is not None:
+            self._sprite.set_paused(True)
+        if self._dragging:
+            self._dragging = False
+            self.sm.on_release()
+        super().hideEvent(event)
 
     def _fps_for(self, state):
         table = {
@@ -117,8 +145,11 @@ class PetWindow(QWidget):
         self._timer.setInterval(max(1, int(1000 / self._fps_for(self.sm.state))))
 
     def stop(self):
+        self._running = False
         self._timer.stop()
         self._keep_top_timer.stop()
+        if self._sprite is not None:
+            self._sprite.stop()
 
     def _load_sprite(self):
         if self._sprite is not None:
@@ -127,10 +158,12 @@ class PetWindow(QWidget):
         if self.style == "image":
             sprite = ImageSprite(self.config.get("image_path", ""))
             self._sprite = sprite if sprite.valid else None
+            sprite.set_paused(not (self._running and self.isVisible()))
 
     def apply_config(self):
         self.scale = float(self.config.get("scale", 1.0))
         self.style = self.config.get("style", "blob")
+        self._fps = max(10, min(60, int(self.config.get("fps", 30))))
         self.size_px = int(BASE_SIZE * self.scale)
         self.setFixedSize(QSize(self.size_px, self.size_px))
         self._load_sprite()
@@ -141,6 +174,9 @@ class PetWindow(QWidget):
             walk_speed=float(self.config.get("walk_speed", 60.0)),
             scale=self.scale,
         )
+        self._mask_state = None
+        self.move(self._clamp(self.pos(), self.screen().availableGeometry()))
+        self._apply_interval()
         self._render()
 
     def _context(self):
@@ -156,7 +192,7 @@ class PetWindow(QWidget):
         )
 
     def _tick(self):
-        dt = min(self._elapsed.restart() / 1000.0, 0.1)
+        dt = min(self._elapsed.restart() / 1000.0, 0.25)
         self._clock += dt
         ctx = self._context()
         if self._perch_hwnd and not self._dragging:
@@ -167,7 +203,16 @@ class PetWindow(QWidget):
             if extra is not None:
                 move = extra
             if not move.isNull():
-                self.move(self._clamp(self.pos() + move.toPoint(), ctx.screen))
+                total = move + self._motion_remainder
+                step = total.toPoint()
+                intended = self.pos() + step
+                clamped = self._clamp(intended, ctx.screen)
+                self._motion_remainder = total - QPointF(step)
+                if clamped.x() != intended.x():
+                    self._motion_remainder.setX(0.0)
+                if clamped.y() != intended.y():
+                    self._motion_remainder.setY(0.0)
+                self.move(clamped)
         else:
             self.sm.tick(dt, ctx)
 
@@ -180,6 +225,7 @@ class PetWindow(QWidget):
         if self.sm.state != self._last_state:
             prev = self._last_state
             self._last_state = self.sm.state
+            self._motion_remainder = QPointF()
             self._apply_interval()
             self.state_changed.emit(self.sm.state)
             if self.sm.state == PetState.THROWN and prev != PetState.THROWN:
@@ -207,6 +253,10 @@ class PetWindow(QWidget):
             self.particles.sweat(self.size_px * 0.72, self.size_px * 0.28, count=4)
 
     def _spring(self, dt):
+        if (self._sx == 1.0 and self._sy == 1.0
+                and abs(self._sx_v) < 0.01 and abs(self._sy_v) < 0.01):
+            self._sx_v = self._sy_v = 0.0
+            return
         k = 320.0
         c = 24.0
         step = 1.0 / 240.0
@@ -289,12 +339,13 @@ class PetWindow(QWidget):
         frame = self._compose(render_size)
         frame.setDevicePixelRatio(dpr)
         self._frame = frame
-        self._mask_counter += 1
-        deforming = abs(self._sx - 1.0) > 0.01 or abs(self._sy - 1.0) > 0.01
-        if (self.sm.state != self._mask_state or self._mask_counter % 3 == 0
-                or self.particles.active or deforming or self.style == "image"):
+        # Native window masks are much costlier than ordinary repainting.
+        # Refresh immediately on state changes; otherwise cap them at 12 Hz.
+        now = time.monotonic()
+        if self.sm.state != self._mask_state or now - self._mask_updated_at >= 1 / 12:
             self._update_mask()
             self._mask_state = self.sm.state
+            self._mask_updated_at = now
         self.update()
 
     def _update_mask(self):
@@ -329,12 +380,14 @@ class PetWindow(QWidget):
     def set_always_on_top(self, enabled):
         if bool(self.windowFlags() & Qt.WindowStaysOnTopHint) == bool(enabled):
             return
+        visible = self.isVisible()
         self.setWindowFlag(Qt.WindowStaysOnTopHint, bool(enabled))
-        if self.isVisible():
+        if visible:
             self.show()
 
     def enter_talk(self):
         self.unperch()
+        self._walk_target = None
         self.sm.on_double_click()
 
     def finish_talk(self):
@@ -365,14 +418,16 @@ class PetWindow(QWidget):
         if self._walk_target is None:
             return None
         x = self.pos().x()
+        self._walk_target = max(ctx.screen.left(), min(
+            self._walk_target, ctx.screen.right() - self.width() + 1))
         dx = self._walk_target - x
         if abs(dx) < 8:
             self._walk_target = None
             self.sm.force(PetState.IDLE)
             return QPointF(0.0, 0.0)
-        self.sm.facing = 1 if dx > 0 else -1
         if self.sm.state != PetState.WALK:
             self.sm.force(PetState.WALK)
+        self.sm.facing = 1 if dx > 0 else -1
         speed = self.sm.walk_speed * self.sm.scale
         step = max(-speed * dt, min(speed * dt, dx))
         return QPointF(step, 0.0)
@@ -398,6 +453,8 @@ class PetWindow(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._dragging = True
+            self._motion_remainder = QPointF()
+            self._walk_target = None
             self._moved = False
             self._drag_samples.clear()
             self._drag_samples.append((time.monotonic(), event.globalPosition().toPoint()))
@@ -434,6 +491,7 @@ class PetWindow(QWidget):
         if event.button() == Qt.LeftButton and self._dragging:
             self._dragging = False
             if self._moved:
+                self._drag_samples.append((time.monotonic(), event.globalPosition().toPoint()))
                 self.sm.on_release(self._release_velocity())
             else:
                 local = event.position()

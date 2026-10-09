@@ -18,6 +18,7 @@ class InputBubble(QWidget):
     """宠物旁的迷你输入气泡（只有输入框 + 发送）。"""
 
     submitted = Signal(str)
+    closed = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
@@ -135,6 +136,7 @@ class InputBubble(QWidget):
 
     def hideEvent(self, event):
         self._follow_timer.stop()
+        self.closed.emit()
         super().hideEvent(event)
 
     def keyPressEvent(self, event):

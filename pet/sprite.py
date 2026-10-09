@@ -19,6 +19,7 @@ class ImageSprite:
         self._cache_sig = None
         self._scaled = None
         self._glow = None
+        self._glow_pad = 0
         if not self.path or not os.path.exists(self.path):
             return
         if self.path.lower().endswith(".gif"):
@@ -43,7 +44,16 @@ class ImageSprite:
 
     def stop(self):
         if self._movie is not None:
-            self._movie.stop()
+            movie = self._movie
+            self._movie = None
+            movie.stop()
+            movie.setFileName("")
+            movie.deleteLater()
+            self.valid = False
+
+    def set_paused(self, paused):
+        if self._movie is not None:
+            self._movie.setPaused(paused)
 
     def _prepare(self, base, size):
         src_w = max(base.width(), 1)
@@ -52,22 +62,35 @@ class ImageSprite:
         draw_w = max(1, int(src_w * factor))
         draw_h = max(1, int(src_h * factor))
 
-        sig = (size, id(base))
+        sig = (size, base.cacheKey())
         if self._cache_sig == sig and self._scaled is not None:
             return draw_w, draw_h
 
         scaled = base.scaled(draw_w, draw_h, Qt.IgnoreAspectRatio,
                              Qt.SmoothTransformation)
-        glow = QPixmap(scaled.size())
+        # Build the outline once per source frame/size rather than drawing
+        # twelve translucent copies on every animation tick.
+        pad = math.ceil(max(2.0, size * 0.016))
+        silhouette = QPixmap(scaled.size())
+        silhouette.fill(Qt.transparent)
+        sp = QPainter(silhouette)
+        sp.drawPixmap(0, 0, scaled)
+        sp.setCompositionMode(QPainter.CompositionMode_SourceIn)
+        sp.fillRect(silhouette.rect(), QColor(255, 255, 255, 165))
+        sp.end()
+        glow = QPixmap(draw_w + pad * 2, draw_h + pad * 2)
         glow.fill(Qt.transparent)
         gp = QPainter(glow)
-        gp.drawPixmap(0, 0, scaled)
-        gp.setCompositionMode(QPainter.CompositionMode_SourceIn)
-        gp.fillRect(glow.rect(), QColor(255, 255, 255, 165))
+        radius = max(2.0, size * 0.016)
+        for index in range(12):
+            angle = math.radians(index * 30)
+            gp.drawPixmap(QPointF(pad + math.cos(angle) * radius,
+                                 pad + math.sin(angle) * radius), silhouette)
         gp.end()
 
         self._scaled = scaled
         self._glow = glow
+        self._glow_pad = pad
         self._cache_sig = sig
         return draw_w, draw_h
 
@@ -109,13 +132,8 @@ class ImageSprite:
         painter.rotate(sway * 180.0 / math.pi)
 
         if glow and self._glow is not None:
-            radius = max(2.0, size * 0.016)
-            for index in range(12):
-                angle = math.radians(index * 30)
-                painter.drawPixmap(
-                    QPointF(-half_w + math.cos(angle) * radius,
-                            -half_h + math.sin(angle) * radius),
-                    self._glow)
+            painter.drawPixmap(QPointF(-half_w - self._glow_pad,
+                                      -half_h - self._glow_pad), self._glow)
 
         painter.drawPixmap(QRectF(-half_w, -half_h, draw_w, draw_h),
                            scaled, QRectF(scaled.rect()))
