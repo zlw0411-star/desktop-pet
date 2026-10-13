@@ -1,6 +1,6 @@
 from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QHBoxLayout, QLineEdit, QPushButton, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QLabel, QLineEdit, QPushButton, QVBoxLayout, QWidget
 
 TOP = QColor(255, 255, 255, 250)
 BOTTOM = QColor(238, 246, 255, 250)
@@ -19,6 +19,8 @@ class InputBubble(QWidget):
 
     submitted = Signal(str)
     closed = Signal()
+    stop_requested = Signal()
+    retry_requested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
@@ -26,10 +28,15 @@ class InputBubble(QWidget):
         self.setFixedWidth(272)
         self._anchor = None
         self._side = "right"
+        self._busy = False
+        self._mode = "send"
+        self._can_retry = False
+        self._mode_label_text = "AI"
 
         self.input = QLineEdit()
         self.input.setPlaceholderText("和我说点什么…")
         self.input.setFont(QFont("Microsoft YaHei UI", 9))
+        self.input.setMinimumWidth(100)
         self.input.setMinimumHeight(30)
         self.input.setStyleSheet(
             "QLineEdit{border:1px solid #cfe3f2;border-radius:15px;padding:4px 12px;"
@@ -47,10 +54,29 @@ class InputBubble(QWidget):
             "QPushButton:hover{background:%s;}" % (ACCENT.name(), ACCENT_HOVER.name()))
         self.send_btn.clicked.connect(self._submit)
 
-        self._row = QHBoxLayout(self)
+        self.retry_btn = QPushButton("重试")
+        self.retry_btn.setCursor(Qt.PointingHandCursor)
+        self.retry_btn.setMinimumHeight(30)
+        self.retry_btn.setFont(QFont("Microsoft YaHei UI", 9, QFont.DemiBold))
+        self.retry_btn.setStyleSheet("QPushButton{border:1px solid #b9d9ed;border-radius:15px;padding:4px 8px;background:#f7fbff;color:#438ab5;} QPushButton:hover{background:#eaf6ff;}")
+        self.retry_btn.clicked.connect(self.retry_requested)
+        self.retry_btn.hide()
+        self.status_label = QLabel("AI · 就绪")
+        self.status_label.setFont(QFont("Microsoft YaHei UI", 8))
+        self.status_label.setStyleSheet("color:#648198;padding-left:4px;")
+
+        outer = QVBoxLayout(self)
+        self._outer = outer
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._row = QHBoxLayout()
         self._row.setSpacing(6)
         self._row.addWidget(self.input, 1)
         self._row.addWidget(self.send_btn)
+        self._row.addWidget(self.retry_btn)
+        self._row.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.status_label, 0)
+        outer.addLayout(self._row)
         self._apply_margins()
 
         self._follow_timer = QTimer(self)
@@ -61,19 +87,50 @@ class InputBubble(QWidget):
         pad = MARGIN + 6
         extra = MARGIN + TAIL + 4
         if self._side == "left":
-            self._row.setContentsMargins(pad, pad, extra, pad)
+            self._outer.setContentsMargins(pad, pad, extra, pad)
         elif self._side == "bottom":
-            self._row.setContentsMargins(pad, pad, pad, extra)
+            self._outer.setContentsMargins(pad, pad, pad, extra + 2)
         else:
-            self._row.setContentsMargins(extra, pad, pad, pad)
+            self._outer.setContentsMargins(extra, pad, pad, pad)
 
     def _submit(self):
+        if self._busy:
+            self.stop_requested.emit()
+            return
         text = self.input.text().strip()
         if not text:
             return
         self.input.clear()
         self.submitted.emit(text)
         self.input.setFocus()
+
+    def set_busy(self, busy):
+        self._busy = bool(busy)
+        self.send_btn.setText("停止" if self._busy else "发送")
+        self.input.setEnabled(True)
+
+    def set_mode(self, mode):
+        self._mode = str(mode or "send")
+        self._mode_label_text = {"offline": "本地模式", "ai": "AI 模式"}.get(self._mode, self._mode)
+        self.status_label.setText("%s · %s" % (self._mode_label_text, "正在回复…" if self._busy else "就绪"))
+        self.send_btn.setText("停止" if self._busy else "发送")
+
+    def set_status(self, status, can_retry=False):
+        self._can_retry = bool(can_retry)
+        if status == "failed" and self._can_retry:
+            self._mode = "retry"
+        elif status in ("complete", "stopped", "waiting", "streaming"):
+            self._mode = "send"
+        self.set_busy(status in ("waiting", "streaming"))
+        label = {
+            "waiting": "等待回复…", "streaming": "正在回复…",
+            "complete": "就绪", "stopped": "已停止", "failed": "回复失败",
+        }.get(status, str(status))
+        if status == "failed" and self._can_retry:
+            label += " · 可重试"
+        self.status_label.setText("%s · %s" % (self._mode_label_text, label))
+        self.retry_btn.setVisible(status == "failed" and self._can_retry)
+        self.adjustSize()
 
     def popup_beside(self, anchor):
         self._anchor = anchor

@@ -5,7 +5,7 @@ from collections import deque
 from PySide6.QtCore import (QElapsedTimer, QPoint, QPointF, QSize, Qt, QTimer,
                             Signal)
 from PySide6.QtGui import QPainter, QPixmap, QRegion
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QApplication, QWidget
 
 from . import animation
 from .effects import ParticleField
@@ -46,6 +46,7 @@ class PetWindow(QWidget):
             wander=bool(config.get("wander", True)),
             follow_cursor=bool(config.get("follow_cursor", False)),
             sleep_enabled=bool(config.get("sleep_enabled", True)),
+            focus_mode=bool(config.get("focus_mode", False)),
         )
 
         self._frame = None
@@ -67,10 +68,15 @@ class PetWindow(QWidget):
         self._startle_cooldown = 0.0
         self._sparkle_timer = 0.0
         self._clock = 0.0
+        self._visual_clock = 0.0
         self._walk_target = None
         self._motion_remainder = QPointF()
         self._dance_left = 0
+        self._scripted_dance = False
         self._perch_hwnd = 0
+        self._state_transition = None
+        self._last_render_state = self.sm.state
+        self._last_render_t = self.sm.t
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -82,6 +88,16 @@ class PetWindow(QWidget):
         self._keep_top_timer.timeout.connect(self._keep_on_top)
 
         self._place_initial()
+        app = QApplication.instance()
+        if app is not None:
+            app.screenRemoved.connect(self._on_screen_removed)
+
+    def _on_screen_removed(self, _screen):
+        screens = QApplication.screens()
+        if screens:
+            screen = min(screens, key=lambda s: self._rect_distance(
+                s.availableGeometry(), self.pos()))
+            self.move(self._clamp(self.pos(), screen.availableGeometry()))
 
     def _keep_on_top(self):
         if not self.isVisible():
@@ -94,6 +110,12 @@ class PetWindow(QWidget):
         saved = self.config.get("start_position")
         if isinstance(saved, (list, tuple)) and len(saved) == 2:
             pos = QPoint(int(saved[0]), int(saved[1]))
+            screens = QApplication.screens()
+            if screens:
+                target = next((s for s in screens if s.availableGeometry().contains(pos)), None)
+                if target is None:
+                    target = min(screens, key=lambda s: self._rect_distance(s.availableGeometry(), pos))
+                screen = target.availableGeometry()
         else:
             pos = QPoint(screen.right() - self.size_px - 40,
                          screen.bottom() - self.size_px + 1)
@@ -161,6 +183,7 @@ class PetWindow(QWidget):
             sprite.set_paused(not (self._running and self.isVisible()))
 
     def apply_config(self):
+        was_focus = self.sm.focus_mode
         self.scale = float(self.config.get("scale", 1.0))
         self.style = self.config.get("style", "blob")
         self._fps = max(10, min(60, int(self.config.get("fps", 30))))
@@ -173,9 +196,15 @@ class PetWindow(QWidget):
             sleep_enabled=bool(self.config.get("sleep_enabled", True)),
             walk_speed=float(self.config.get("walk_speed", 60.0)),
             scale=self.scale,
+            focus_mode=bool(self.config.get("focus_mode", False)),
         )
+        if not was_focus and self.sm.focus_mode:
+            if self.sm.state == PetState.WALK and self._walk_target is None:
+                self.sm.force(PetState.IDLE)
+            elif self.sm.state == PetState.HOP and not self._scripted_dance:
+                self.sm.force(PetState.FALL)
         self._mask_state = None
-        self.move(self._clamp(self.pos(), self.screen().availableGeometry()))
+        self.move(self._clamp(self.pos(), self._screen_for_pos(self.pos()).availableGeometry()))
         self._apply_interval()
         self._render()
 
@@ -189,17 +218,25 @@ class PetWindow(QWidget):
             follow_cursor=bool(self.config.get("follow_cursor", False)),
             sleep_enabled=bool(self.config.get("sleep_enabled", True)),
             bottom_margin=int(self.config.get("bottom_margin", 6)),
+            focus_mode=bool(self.config.get("focus_mode", False)),
         )
 
     def _tick(self):
         dt = min(self._elapsed.restart() / 1000.0, 0.25)
         self._clock += dt
+        self._visual_clock += dt
         ctx = self._context()
         if self._perch_hwnd and not self._dragging:
-            self._follow_perch()
+            if not self._follow_perch():
+                self.unperch()
+                self.sm.force(PetState.FALL)
+            else:
+                self.sm.tick(dt, ctx)
+                if self.sm.state not in (PetState.IDLE, PetState.SLEEP, PetState.PET, PetState.REACT):
+                    self.sm.force(PetState.IDLE)
         elif not self._dragging:
             extra = self._walk_step(dt, ctx)
-            move = self.sm.tick(dt, ctx)
+            move = self.sm.tick(dt, ctx, scripted_walk=self._walk_target is not None)
             if extra is not None:
                 move = extra
             if not move.isNull():
@@ -223,18 +260,29 @@ class PetWindow(QWidget):
         self._ambient_sparkles(dt)
 
         if self.sm.state != self._last_state:
-            prev = self._last_state
+            prev = self._last_render_state
+            prev_t = self._last_render_t
             self._last_state = self.sm.state
             self._motion_remainder = QPointF()
             self._apply_interval()
             self.state_changed.emit(self.sm.state)
             if self.sm.state == PetState.THROWN and prev != PetState.THROWN:
                 self.thrown.emit()
+            if self.sm.state in (PetState.DRAG, PetState.FALL, PetState.THROWN, PetState.HOP):
+                self._state_transition = None
+            elif prev not in (PetState.DRAG, PetState.FALL, PetState.THROWN, PetState.HOP):
+                self._state_transition = (prev, prev_t, 0.0)
             if self._dance_left and prev in (PetState.HOP, PetState.FALL) and self.sm.state in (
                     PetState.IDLE, PetState.WALK):
                 self._dance_left -= 1
                 if self._dance_left:
                     self.sm.force(PetState.HOP)
+                else:
+                    self._scripted_dance = False
+        if self._state_transition:
+            old_state, old_t, elapsed = self._state_transition
+            elapsed += dt
+            self._state_transition = None if elapsed >= 0.12 else (old_state, old_t, elapsed)
         self._render()
 
     def _handle_events(self, dt):
@@ -280,7 +328,7 @@ class PetWindow(QWidget):
         cursor = ctx.cursor
         last = self._last_cursor
         self._last_cursor = cursor
-        if self._dragging or self._startle_cooldown > 0.0:
+        if self._dragging or self._walk_target is not None or self._startle_cooldown > 0.0:
             return
         speed = math.hypot(cursor.x() - last.x(), cursor.y() - last.y()) / max(dt, 1e-3)
         center = QPointF(ctx.pos.x() + ctx.size.width() / 2.0,
@@ -288,7 +336,8 @@ class PetWindow(QWidget):
         dist = math.hypot(cursor.x() - center.x(), cursor.y() - center.y())
         can_react = self.sm.state in (PetState.IDLE, PetState.WALK, PetState.SLEEP,
                                       PetState.PET, PetState.REACT)
-        if dist < ctx.size.width() * 0.78 and speed > 1500.0 and can_react:
+        if (not self.sm.focus_mode and dist < ctx.size.width() * 0.78
+                and speed > 1500.0 and can_react):
             direction = 1 if cursor.x() < center.x() else -1
             self.sm.on_startle(direction)
             self.particles.sweat(center.x(), center.y() - ctx.size.height() * 0.3, count=4)
@@ -318,7 +367,8 @@ class PetWindow(QWidget):
                                        self.sm.facing, self.sm.look)
         else:
             base = animation.render_frame(target, self.sm.state, self.sm.t,
-                                          self.sm.facing, self.sm.look, self.style)
+                                          self.sm.facing, self.sm.look, self.style,
+                                          self._state_transition, self._visual_clock)
         deforming = abs(self._sx - 1.0) > 0.01 or abs(self._sy - 1.0) > 0.01
         if deforming and self.style != "image":
             out = QPixmap(target, target)
@@ -339,6 +389,8 @@ class PetWindow(QWidget):
         frame = self._compose(render_size)
         frame.setDevicePixelRatio(dpr)
         self._frame = frame
+        self._last_render_state = self.sm.state
+        self._last_render_t = self.sm.t
         # Native window masks are much costlier than ordinary repainting.
         # Refresh immediately on state changes; otherwise cap them at 12 Hz.
         now = time.monotonic()
@@ -386,6 +438,7 @@ class PetWindow(QWidget):
             self.show()
 
     def enter_talk(self):
+        self._cancel_scripted_motion()
         self.unperch()
         self._walk_target = None
         self.sm.on_double_click()
@@ -394,25 +447,54 @@ class PetWindow(QWidget):
         self.sm.finish_talk()
 
     def walk_to_cursor(self):
+        self._cancel_scripted_motion()
         self.unperch()
         cursor = self.cursor().pos()
         self._walk_target = cursor.x() - self.size_px // 2
+        self.sm.force(PetState.WALK)
+        return True
 
     def dance(self):
+        self._cancel_scripted_motion()
         self.unperch()
         self._walk_target = None
         self._dance_left = 3
+        self._scripted_dance = True
         self.sm.force(PetState.HOP)
+        return True
 
     def perch(self, hwnd):
         if not hwnd:
             return False
+        self._cancel_scripted_motion()
         self._walk_target = None
         self._perch_hwnd = int(hwnd)
         return self._follow_perch()
 
     def unperch(self):
+        changed = bool(self._perch_hwnd)
         self._perch_hwnd = 0
+        if changed and self.sm.state in (PetState.IDLE, PetState.SLEEP, PetState.PET, PetState.REACT):
+            self.sm.force(PetState.FALL)
+        return changed
+
+    def _cancel_scripted_motion(self):
+        self._dance_left = 0
+        self._scripted_dance = False
+        self._walk_target = None
+
+    @staticmethod
+    def _rect_distance(rect, pos):
+        dx = max(rect.left() - pos.x(), 0, pos.x() - rect.right())
+        dy = max(rect.top() - pos.y(), 0, pos.y() - rect.bottom())
+        return dx * dx + dy * dy
+
+    def _screen_for_pos(self, pos):
+        screens = QApplication.screens()
+        if not screens:
+            return self.screen()
+        return QApplication.screenAt(pos) or min(
+            screens, key=lambda s: self._rect_distance(s.availableGeometry(), pos))
 
     def _walk_step(self, dt, ctx):
         if self._walk_target is None:
@@ -435,7 +517,8 @@ class PetWindow(QWidget):
     def _follow_perch(self):
         from . import win32util
 
-        if not win32util.is_window_visible(self._perch_hwnd):
+        if (not win32util.is_window_visible(self._perch_hwnd)
+                or win32util.is_window_minimized(self._perch_hwnd)):
             self._perch_hwnd = 0
             return False
         box = win32util.window_rect(self._perch_hwnd)
@@ -445,13 +528,15 @@ class PetWindow(QWidget):
         left, top, right, _bottom = box
         x = int((left + right) / 2 - self.size_px / 2)
         y = int(top - self.size_px + 18)
-        self.move(self._clamp(QPoint(x, y), self.screen().availableGeometry()))
+        target = QPoint(x, y)
+        self.move(self._clamp(target, self._screen_for_pos(target).availableGeometry()))
         if self.sm.state not in (PetState.IDLE, PetState.SLEEP, PetState.PET, PetState.REACT):
             self.sm.force(PetState.IDLE)
         return True
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
+            self._cancel_scripted_motion()
             self._dragging = True
             self._motion_remainder = QPointF()
             self._walk_target = None
@@ -471,7 +556,9 @@ class PetWindow(QWidget):
             if (new_pos - self.pos()).manhattanLength() > 3:
                 self._moved = True
             self._drag_samples.append((time.monotonic(), global_pos))
-            self.move(self._clamp(new_pos, self.screen().availableGeometry()))
+            global_pos = event.globalPosition().toPoint()
+            screen = QApplication.screenAt(global_pos) or self._screen_for_pos(new_pos)
+            self.move(self._clamp(new_pos, screen.availableGeometry()))
 
     def _release_velocity(self):
         if len(self._drag_samples) < 2:
@@ -494,6 +581,7 @@ class PetWindow(QWidget):
                 self._drag_samples.append((time.monotonic(), event.globalPosition().toPoint()))
                 self.sm.on_release(self._release_velocity())
             else:
+                self._cancel_scripted_motion()
                 local = event.position()
                 head = local.y() < self.size_px * 0.42
                 self.sm.on_click(pet=head)
@@ -505,6 +593,7 @@ class PetWindow(QWidget):
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
+            self._cancel_scripted_motion()
             self._dragging = False
             self.sm.on_double_click()
             self.chat_requested.emit()

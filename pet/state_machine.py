@@ -30,17 +30,19 @@ class Context:
     follow_cursor: bool = False
     sleep_enabled: bool = True
     bottom_margin: int = 0
+    focus_mode: bool = False
 
 
 class StateMachine:
     def __init__(self, walk_speed=60.0, scale=1.0, wander=True,
-                 follow_cursor=False, sleep_enabled=True, rng=None):
+                 follow_cursor=False, sleep_enabled=True, focus_mode=False, rng=None):
         self.rng = rng or random.Random()
         self.walk_speed = walk_speed
         self.scale = scale
         self.wander = wander
         self.follow_cursor = follow_cursor
         self.sleep_enabled = sleep_enabled
+        self.focus_mode = focus_mode
 
         self.state = PetState.IDLE
         self.t = 0.0
@@ -55,7 +57,7 @@ class StateMachine:
         self._enter(PetState.IDLE)
 
     def update_options(self, wander=None, follow_cursor=None, sleep_enabled=None,
-                       walk_speed=None, scale=None):
+                       walk_speed=None, scale=None, focus_mode=None):
         if wander is not None:
             self.wander = wander
         if follow_cursor is not None:
@@ -66,6 +68,8 @@ class StateMachine:
             self.walk_speed = walk_speed
         if scale is not None:
             self.scale = scale
+        if focus_mode is not None:
+            self.focus_mode = focus_mode
 
     @property
     def gravity(self):
@@ -141,6 +145,8 @@ class StateMachine:
         self._enter(PetState.TALK)
 
     def on_startle(self, direction):
+        if self.focus_mode:
+            return
         if self.state in (PetState.DRAG, PetState.THROWN, PetState.HOP):
             return
         self.idle_streak = 0
@@ -158,20 +164,20 @@ class StateMachine:
             self.idle_streak = 0
             self._enter(PetState.REACT)
 
-    def tick(self, dt, ctx):
+    def tick(self, dt, ctx, scripted_walk=False):
         self.t += dt
         self.just_landed = False
         self.land_impact = 0.0
         move = QPointF(0.0, 0.0)
         state = self.state
-        self._update_look(ctx)
+        self._update_look(ctx, dt)
 
         if state == PetState.IDLE:
             if self.t >= self.duration:
                 self._choose_next_idle()
         elif state == PetState.WALK:
             speed = self.walk_speed * self.scale
-            if self.follow_cursor:
+            if self.follow_cursor and not scripted_walk:
                 dx = ctx.cursor.x() - (ctx.pos.x() + ctx.size.width() / 2)
                 if abs(dx) <= ctx.size.width() * 0.25:
                     self._enter(PetState.IDLE)
@@ -269,25 +275,30 @@ class StateMachine:
         if self.sleep_enabled and self.idle_streak >= 3 and r < 0.40:
             self.idle_streak = 0
             self._enter(PetState.SLEEP)
-        elif self.follow_cursor:
+        elif self.follow_cursor and not self.focus_mode:
             self.facing = 1 if self.look.x() >= 0 else -1
             self._enter(PetState.WALK)
-        elif r < 0.12:
+        elif not self.focus_mode and r < 0.12:
             self._enter(PetState.HOP)
         elif r < 0.22:
             self._enter(PetState.REACT)
-        elif self.wander and r < 0.72:
+        elif not self.focus_mode and self.wander and r < 0.72:
             self._enter(PetState.WALK)
         else:
             self._enter(PetState.IDLE)
 
-    def _update_look(self, ctx):
+    def _update_look(self, ctx, dt):
         cx = ctx.pos.x() + ctx.size.width() / 2.0
         cy = ctx.pos.y() + ctx.size.height() * 0.45
         dx = ctx.cursor.x() - cx
         dy = ctx.cursor.y() - cy
         length = max((dx * dx + dy * dy) ** 0.5, 1.0)
-        self.look = QPointF(dx / length, dy / length)
+        target_x, target_y = dx / length, dy / length
+        # A short exponential ease keeps the pupils smooth without adding any
+        # delay to movement, dragging, or the state machine itself.
+        alpha = 1.0 - math.exp(-max(0.0, min(dt, 0.1)) / 0.045)
+        self.look = QPointF(self.look.x() + (target_x - self.look.x()) * alpha,
+                            self.look.y() + (target_y - self.look.y()) * alpha)
         if self.state not in (PetState.WALK, PetState.THROWN, PetState.HOP):
             if abs(dx) > ctx.size.width() * 0.7:
                 self.facing = 1 if dx > 0 else -1

@@ -41,23 +41,25 @@ GHOST_OUTLINE = QColor(160, 185, 215, 90)
 STYLES = ("girl", "ghost", "doro", "blob")
 
 
-def render_frame(size, state, t, facing=1, look=None, style="blob"):
+def render_frame(size, state, t, facing=1, look=None, style="blob", transition=None,
+                 blink_t=None):
     look = look or QPointF(0.0, 0.0)
     if style == "girl":
         from .girl import _render_girl
 
-        return _render_girl(size, state, t, facing, look)
+        return _render_girl(size, state, t, facing, look, transition, blink_t)
     if style == "ghost":
-        return _render_ghost(size, state, t, facing, look)
+        return _render_ghost(size, state, t, facing, look, transition, blink_t)
     if style == "doro":
-        return _render_doro(size, state, t, facing, look)
+        return _render_doro(size, state, t, facing, look, transition, blink_t)
 
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     painter = QPainter(pm)
     painter.setRenderHint(QPainter.Antialiasing, True)
 
-    bob, squash, stretch, tilt, eye_open, mouth_open, blink = _pose(state, t, size)
+    bob, squash, stretch, tilt, eye_open, mouth_open, blink = _transition_pose(
+        state, t, size, transition, blink_t)
 
     cx = size / 2.0
     cy = size * 0.55 + bob
@@ -100,7 +102,7 @@ def render_frame(size, state, t, facing=1, look=None, style="blob"):
     return pm
 
 
-def _pose(state, t, size):
+def _pose(state, t, size, blink_t=None):
     bob = squash = stretch = tilt = 0.0
     squash = 1.0
     stretch = 1.0
@@ -162,12 +164,22 @@ def _pose(state, t, size):
         eye_open = 0.75
         mouth_open = 0.2
     if state != PetState.SLEEP:
-        cycle = t % 3.4
-        if cycle > 3.15:
-            blink = 1.0
+        cycle = (t if blink_t is None else blink_t) % 3.4
+        if cycle > 3.20:
+            blink = max(0.0, 1.0 - (cycle - 3.20) / 0.12)
         elif cycle > 3.0:
-            blink = (3.15 - cycle) / 0.15
+            blink = min(1.0, (cycle - 3.0) / 0.20)
     return bob, squash, stretch, tilt, eye_open, mouth_open, blink
+
+
+def _transition_pose(state, t, size, transition, blink_t=None):
+    current = _pose(state, t, size, blink_t)
+    if not transition:
+        return current
+    old_state, old_t, elapsed = transition
+    mix = max(0.0, min(1.0, elapsed / 0.12))
+    previous = _pose(old_state, old_t, size, blink_t)
+    return tuple(a + (b - a) * mix for a, b in zip(previous, current))
 
 
 def _draw_shadow(painter, size, cx, by, state, t, asleep):
@@ -253,13 +265,13 @@ def _draw_mouth(painter, x, y, size, mouth_open, asleep):
         painter.drawEllipse(QPointF(x, y), size * 0.045, open_h)
 
 
-def _render_doro(size, state, t, facing, look):
+def _render_doro(size, state, t, facing, look, transition=None, blink_t=None):
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing, True)
 
-    bob, squash, stretch, tilt, eye_open, mouth_open, blink = _pose(state, t, size)
+    bob, squash, stretch, tilt, eye_open, mouth_open, blink = _transition_pose(state, t, size, transition, blink_t)
     asleep = state == PetState.SLEEP
 
     cx = size * 0.5
@@ -363,13 +375,13 @@ def _draw_doro_face(painter, cx, cy, head_r, size, look, eye_open, blink, mouth_
         painter.drawEllipse(QPointF(cx, my), size * 0.035, mouth_open * size * 0.06)
 
 
-def _render_ghost(size, state, t, facing, look):
+def _render_ghost(size, state, t, facing, look, transition=None, blink_t=None):
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing, True)
 
-    bob, squash, stretch, tilt, eye_open, mouth_open, blink = _pose(state, t, size)
+    bob, squash, stretch, tilt, eye_open, mouth_open, blink = _transition_pose(state, t, size, transition, blink_t)
     asleep = state == PetState.SLEEP
 
     cx = size * 0.5

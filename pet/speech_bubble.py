@@ -1,6 +1,6 @@
-from PySide6.QtCore import QPoint, QRect, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QWidget
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QLinearGradient, QPainter, QPainterPath, QPen, QTextLayout, QTextOption
+from PySide6.QtWidgets import QPushButton, QWidget
 
 BUBBLE_TOP = QColor(255, 255, 255, 248)
 BUBBLE_BOTTOM = QColor(238, 246, 255, 248)
@@ -21,14 +21,24 @@ MAX_HIDE_MS = 12000
 class SpeechBubble(QWidget):
     """宠物头顶的漫画式气泡，用于显示回复（支持流式追加）。"""
 
+    full_reply_requested = Signal()
+
     def __init__(self, parent=None):
         super().__init__(parent, Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self._text = ""
+        self._display_text = ""
+        self._display_layout = None
+        self._display_line_count = 0
         self._anchor = None
         self._anchor_getter = None
         self._font = QFont("Microsoft YaHei UI", 9)
+        self._full_button = QPushButton("查看完整回复", self)
+        self._full_button.setCursor(Qt.PointingHandCursor)
+        self._full_button.setStyleSheet("QPushButton{border:0;background:transparent;color:#438ab5;font-size:9pt;text-align:right;} QPushButton:hover{text-decoration:underline;}")
+        self._full_button.clicked.connect(self.full_reply_requested)
+        self._full_button.hide()
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self.hide)
@@ -53,6 +63,7 @@ class SpeechBubble(QWidget):
         if anchor is not None:
             self._anchor = anchor
         self._text = ""
+        self._display_text = ""
         self._resize()
         if not self.isVisible():
             self.show()
@@ -95,11 +106,52 @@ class SpeechBubble(QWidget):
 
     def _resize(self):
         metrics = QFontMetrics(self._font)
-        rect = metrics.boundingRect(
-            QRect(0, 0, MAX_WIDTH, 10000), Qt.TextWordWrap, self._text or " ")
-        width = max(64, min(MAX_WIDTH, rect.width() + 4)) + PAD_X * 2
-        height = rect.height() + PAD_Y * 2
+        width = MAX_WIDTH
+        text_width = width - PAD_X * 2 - 4
+
+        def make_layout(text):
+            layout = QTextLayout(text or " ", self._font)
+            option = QTextOption()
+            option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+            layout.setTextOption(option)
+            layout.beginLayout()
+            lines = []
+            y = 0.0
+            while True:
+                line = layout.createLine()
+                if not line.isValid():
+                    break
+                line.setLineWidth(text_width)
+                line.setPosition(QPointF(0, y))
+                y += line.height()
+                lines.append(line)
+            layout.endLayout()
+            return layout, lines
+
+        layout_text = (self._text or " ").replace("\r\n", "\u2028").replace("\r", "\u2028").replace("\n", "\u2028")
+        full_layout, full_lines = make_layout(layout_text)
+        overflow = len(full_lines) > 6
+        if overflow and full_lines:
+            end = full_lines[5].textStart() + full_lines[5].textLength()
+            prefix = layout_text[:end].rstrip(" \u2028")
+            self._display_text = prefix + "…"
+            self._display_layout, shown = make_layout(self._display_text)
+            while len(shown) > 6 and prefix:
+                prefix = prefix[:-1].rstrip()
+                self._display_text = prefix + "…"
+                self._display_layout, shown = make_layout(self._display_text)
+        else:
+            self._display_text = self._text
+            self._display_layout, shown = full_layout, full_lines
+        self._display_line_count = min(6, len(shown))
+        self._full_button.setVisible(overflow)
+        line_height = max([line.height() for line in shown] or [metrics.height()])
+        height = max(metrics.height(), line_height * self._display_line_count) + PAD_Y * 2
+        if overflow:
+            height += 20
+        width = max(64, min(MAX_WIDTH, width)) + PAD_X * 2
         self.setFixedSize(width + MARGIN * 2, height + MARGIN * 2 + TAIL)
+        self._full_button.setGeometry(self.width() - 132, self.height() - TAIL - 24, 124, 18)
 
     def _reposition(self):
         anchor = self._current_anchor()
@@ -113,7 +165,7 @@ class SpeechBubble(QWidget):
         x = geo.center().x() - self.width() // 2
         y = geo.top() - self.height() + 4
         x = max(screen.left() + 4, min(x, screen.right() - self.width() - 4))
-        y = max(screen.top() + 4, y)
+        y = max(screen.top() + 4, min(y, screen.bottom() - self.height() - 4))
         self.move(QPoint(int(x), int(y)))
 
     def paintEvent(self, event):
@@ -146,7 +198,10 @@ class SpeechBubble(QWidget):
 
         painter.setPen(TEXT_COLOR)
         painter.setFont(self._font)
-        text_rect = QRect(MARGIN + PAD_X, MARGIN + PAD_Y,
-                          self.width() - MARGIN * 2 - PAD_X * 2, int(rect.height()) - PAD_Y * 2)
-        painter.drawText(text_rect, Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignVCenter,
-                         self._text)
+        painter.save()
+        painter.setClipRect(QRect(MARGIN + PAD_X, MARGIN + PAD_Y,
+                                  self.width() - MARGIN * 2 - PAD_X * 2,
+                                  max(0, int(rect.height()) - PAD_Y * 2 - (20 if self._full_button.isVisible() else 0))))
+        if self._display_layout is not None:
+            self._display_layout.draw(painter, QPointF(MARGIN + PAD_X, MARGIN + PAD_Y))
+        painter.restore()

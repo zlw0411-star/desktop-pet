@@ -39,6 +39,13 @@ class TrayManager(QObject):
             lambda checked: self.action_triggered.emit("autostart:" + ("1" if checked else "0")))
         menu.addAction(self.autostart_action)
 
+        self.focus_action = QAction("专注模式", menu)
+        self.focus_action.setCheckable(True)
+        self.focus_action.setChecked(bool(config.get("focus_mode", False)))
+        self.focus_action.toggled.connect(
+            lambda checked: self.action_triggered.emit("focus_mode:" + ("1" if checked else "0")))
+        menu.addAction(self.focus_action)
+
         menu.addSeparator()
         quit_action = QAction("退出", menu)
         quit_action.triggered.connect(lambda: self.action_triggered.emit("quit"))
@@ -78,6 +85,11 @@ class TrayManager(QObject):
         self.autostart_action.blockSignals(True)
         self.autostart_action.setChecked(enabled)
         self.autostart_action.blockSignals(False)
+
+    def set_focus_mode(self, enabled):
+        self.focus_action.blockSignals(True)
+        self.focus_action.setChecked(bool(enabled))
+        self.focus_action.blockSignals(False)
 
     def show(self):
         self.icon.show()

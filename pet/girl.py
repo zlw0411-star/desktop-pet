@@ -26,13 +26,15 @@ RIBBON = QColor(255, 122, 150)
 OUTLINE = QColor(120, 92, 120, 70)
 
 
-def _render_girl(size, state, t, facing, look):
+def _render_girl(size, state, t, facing, look, transition=None, blink_t=None):
     pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing, True)
 
-    bob, squash, stretch, tilt, eye_open, mouth_open, blink = _pose(state, t, size)
+    from .animation import _transition_pose
+    bob, squash, stretch, tilt, eye_open, mouth_open, blink = _transition_pose(
+        state, t, size, transition, blink_t)
     if state == PetState.SLEEP:
         bob += size * 0.012
     asleep = state == PetState.SLEEP

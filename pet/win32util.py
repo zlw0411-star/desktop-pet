@@ -25,6 +25,8 @@ user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
 user32.GetWindowRect.restype = wintypes.BOOL
 user32.IsWindowVisible.argtypes = [wintypes.HWND]
 user32.IsWindowVisible.restype = wintypes.BOOL
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.IsIconic.restype = wintypes.BOOL
 user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
 user32.GetLastInputInfo.restype = wintypes.BOOL
 kernel32.GetTickCount.argtypes = []
@@ -66,3 +68,7 @@ def window_rect(hwnd):
 
 def is_window_visible(hwnd):
     return bool(hwnd) and bool(user32.IsWindowVisible(hwnd))
+
+
+def is_window_minimized(hwnd):
+    return not bool(hwnd) or bool(user32.IsIconic(hwnd))
